@@ -6,10 +6,10 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import json
 import re
-
+from flask_cors import CORS
 load_dotenv()
 app = Flask(__name__)
-
+CORS(app)
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Your detailed instruction prompt
