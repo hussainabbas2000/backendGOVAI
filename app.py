@@ -9,7 +9,14 @@ import re
 from flask_cors import CORS
 load_dotenv()
 app = Flask(__name__)
-CORS(app, resources={r"/analyze-solicitations": {"origins": "http://localhost:9002"}})
+CORS(app, resources={
+    r"/analyze-solicitations": {
+        "origins": [
+            "http://localhost:9002",                     # local dev
+            "https://gov-ai-frontend.vercel.app"           # deployed frontend
+        ]
+    }
+})
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Your detailed instruction prompt
