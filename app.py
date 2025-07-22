@@ -9,7 +9,7 @@ import re
 from flask_cors import CORS
 load_dotenv()
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/analyze-solicitations": {"origins": "http://localhost:9002"}})
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Your detailed instruction prompt
@@ -44,9 +44,9 @@ Response Deadline and Submission Method
 
 Evaluation Criteria (technical, price, past performance, etc.)
 
-Product or Service Description
+Product or Service Description (this is must)
 
-Quantity, Units, and Delivery Schedule
+Quantity, Units, and Delivery Schedule (this is must)
 
 Contracting Officer or POC Contact Info
 
@@ -185,5 +185,5 @@ def analyze_solicitations():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 9000)), debug=True)
 
