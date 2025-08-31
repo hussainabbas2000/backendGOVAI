@@ -1,23 +1,50 @@
 import os
 import tempfile
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Blueprint
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 import json
 import re
 from flask_cors import CORS
+from quote import quote_bp, init_db
+
 load_dotenv()
 app = Flask(__name__)
+# Configure database
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///sam_gov_negotiations.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize database
+db = SQLAlchemy(app)
+
+# Initialize the quote blueprint with the database
+init_db(db)
+
+# Register the blueprint
+app.register_blueprint(quote_bp)
+from quote import NegotiationSession, Supplier, Message
+
+
 CORS(app, resources={
     r"/analyze-solicitations": {
         "origins": [
             "http://localhost:9002",                     # local dev
             "https://gov-ai-frontend.vercel.app"           # deployed frontend
         ]
+    },
+    r"/api/*": {  # This covers all quote blueprint routes
+        "origins": [
+            "http://localhost:3000",                      # Next.js local dev
+            "http://localhost:9002",                      # your existing local dev
+            "https://gov-ai-frontend.vercel.app",         # deployed frontend
+            "*"  # You can restrict this in production
+        ]
     }
 })
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = OpenAI(api_key="")
 
 # Your detailed instruction prompt
 SYSTEM_PROMPT = {
@@ -192,5 +219,9 @@ def analyze_solicitations():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
+    with app.app_context():
+        # Import models first
+        from quote import NegotiationSession, Supplier, Message
+        db.create_all()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 9000)), debug=True)
 
