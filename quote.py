@@ -72,16 +72,8 @@ def extract_requirements_from_opportunity(opportunity_data):
     """Extract key requirements from SAM.gov opportunity using AI"""
     
     # Prepare the opportunity details
-    details = f"""
-    Title: {opportunity_data.get('title', 'N/A')}
-    Department: {opportunity_data.get('department', 'N/A')}
-    Office: {opportunity_data.get('office', 'N/A')}
-    Type: {opportunity_data.get('type', 'N/A')}
-    NAICS Code: {opportunity_data.get('ncode', 'N/A')}
-    Location: {opportunity_data.get('location', {}).get('city', {}).get('name', 'N/A')}, {opportunity_data.get('location', {}).get('state', {}).get('name', 'N/A')}
-    Description: {opportunity_data.get('fullDescription', opportunity_data.get('description', 'N/A'))[:3000]}
-    Closing Date: {opportunity_data.get('closingDate', 'N/A')}
-    """
+    details = opportunity_data
+
     
     prompt = f"""
     Analyze this government contract opportunity and extract the key requirements:
@@ -129,7 +121,7 @@ def extract_requirements_from_opportunity(opportunity_data):
             ]
         }
 
-def generate_initial_request(requirements, company_name, additional_requirements=""):
+def generate_initial_request(opportunity,requirements, company_name, additional_requirements=""):
     """Generate initial quote request based on extracted requirements"""
     
     prompt = f"""
@@ -141,11 +133,13 @@ def generate_initial_request(requirements, company_name, additional_requirements
     Key Requirements: {', '.join(requirements['key_requirements'])}
     Timeline: {requirements['timeline']}
     Additional Requirements: {additional_requirements}
+    Extra Information For Complete Context: {opportunity}
     
     To: {company_name}
     
     Important: 
     - Be professional and reference the government contract opportunity
+    - Make sure to mention any product/service, quantities or requrements that need to be mentioned
     - Mention we're seeking competitive quotes from qualified suppliers
     - Ask for detailed pricing breakdown, delivery timeline, and compliance with requirements
     - Request information about relevant past performance
@@ -338,6 +332,7 @@ def create_negotiation():
         
         # Generate initial request
         initial_message = generate_initial_request(
+            opportunity,
             requirements, 
             name,
             additional_requirements

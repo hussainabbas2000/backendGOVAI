@@ -32,6 +32,7 @@ CORS(app, resources={
     r"/analyze-solicitations": {
         "origins": [
             "http://localhost:9002",                     # local dev
+            r"^http://127\.0\.0\.1(:[0-9]+)?$",
             "https://gov-ai-frontend.vercel.app"           # deployed frontend
         ]
     },
@@ -200,11 +201,7 @@ def analyze_solicitations():
                 }
             ]
         )
-
         raw_output = response.output_text
-
-        
-        
         try:
             parsed_data = parse_raw_output(raw_output)
             return parsed_data
