@@ -13,7 +13,7 @@ load_dotenv()
 quote_bp = Blueprint('quote', __name__, url_prefix='/api')
 
 # Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+client = OpenAI(api_key="")
 
 # We'll use the app's db instance
 db = None
@@ -321,49 +321,52 @@ def create_negotiation():
     while len(supplier_names) < num_suppliers:
         supplier_names.append(f"Qualified Contractor #{len(supplier_names) + 1}")
     
+    initial_messages = []
+    suppliers_data = []
+    
     for name in supplier_names:
         supplier = Supplier(
             session_id=session.id,
             company_name=name,
-            industry=requirements.get('industry_category', 'general')
+            industry=requirements.get('industry_category', 'general'),
+            status='pending'  # Set as pending until initial message is sent
         )
         db.session.add(supplier)
         db.session.commit()
         
-        # Generate initial request
-        initial_message = generate_initial_request(
+        # Generate draft initial message but DON'T save it yet
+        draft_message = generate_initial_request(
             opportunity,
             requirements, 
             name,
             additional_requirements
         )
         
-        message = Message(
-            supplier_id=supplier.id,
-            sender='buyer',
-            content=initial_message
-        )
-        db.session.add(message)
+        # Store draft for frontend to review
+        initial_messages.append({
+            'supplier_id': supplier.id,
+            'supplier_name': name,
+            'draft_message': draft_message
+        })
+        
+        suppliers_data.append({
+            'id': supplier.id,
+            'company_name': supplier.company_name,
+            'status': supplier.status,
+            'negotiation_round': supplier.negotiation_round,
+            'messages': []  # No messages yet
+        })
     
     db.session.commit()
     
-    # Return session data
+    # Return session data with draft initial messages
     return jsonify({
         'id': session.id,
         'opportunity_id': session.opportunity_id,
         'status': session.status,
         'created_at': session.created_at.isoformat(),
-        'suppliers': [{
-            'id': s.id,
-            'company_name': s.company_name,
-            'status': s.status,
-            'negotiation_round': s.negotiation_round,
-            'messages': [{
-                'sender': m.sender,
-                'content': m.content,
-                'price_mentioned': m.price_mentioned
-            } for m in s.messages]
-        } for s in session.suppliers]
+        'initial_messages': initial_messages,  # Include draft messages for review
+        'suppliers': suppliers_data
     })
 
 @quote_bp.route('/negotiate/<int:session_id>')
@@ -397,9 +400,78 @@ def get_negotiation_status(session_id):
         } for s in session.suppliers]
     })
 
+# @quote_bp.route('/negotiate/<int:session_id>/respond/<int:supplier_id>', methods=['POST'])
+# def respond_to_supplier(session_id, supplier_id):
+#     """Generate response to supplier"""
+    
+#     session = NegotiationSession.query.get_or_404(session_id)
+#     supplier = Supplier.query.get_or_404(supplier_id)
+#     requirements = json.loads(session.extracted_requirements)
+    
+#     # Check if this is initial response or negotiation
+#     supplier_messages = Message.query.filter_by(
+#         supplier_id=supplier_id, sender='supplier'
+#     ).count()
+    
+#     if supplier_messages == 0:
+#         # Generate initial quote
+#         response, price = generate_supplier_response(
+#             supplier.company_name,
+#             requirements,
+#             supplier.messages,
+#             0,
+#             session.target_price
+#         )
+        
+#         supplier.initial_price = price
+#         supplier.status = 'negotiating'
+#     else:
+#         # Generate negotiation response
+#         response, price = generate_supplier_response(
+#             supplier.company_name,
+#             requirements,
+#             supplier.messages,
+#             supplier.negotiation_round,
+#             session.target_price
+#         )
+    
+#     # Save supplier message
+#     msg = Message(
+#         supplier_id=supplier_id,
+#         sender='supplier',
+#         content=response,
+#         price_mentioned=extract_price_from_message(response) or price
+#     )
+#     db.session.add(msg)
+    
+#     # Auto-generate buyer response if not final round
+#     if supplier.negotiation_round < 2:
+#         supplier.negotiation_round += 1
+        
+#         # Generate buyer's negotiation response
+#         buyer_response = generate_negotiation_response(
+#             supplier.messages + [msg],
+#             requirements,
+#             supplier.negotiation_round
+#         )
+        
+#         buyer_msg = Message(
+#             supplier_id=supplier_id,
+#             sender='buyer',
+#             content=buyer_response
+#         )
+#         db.session.add(buyer_msg)
+#     else:
+#         # Final round - update final price
+#         supplier.final_price = extract_price_from_message(response) or price
+    
+#     db.session.commit()
+#     return jsonify({'success': True})
+
+
 @quote_bp.route('/negotiate/<int:session_id>/respond/<int:supplier_id>', methods=['POST'])
 def respond_to_supplier(session_id, supplier_id):
-    """Generate response to supplier"""
+    """Generate supplier response only - no auto buyer response"""
     
     session = NegotiationSession.query.get_or_404(session_id)
     supplier = Supplier.query.get_or_404(supplier_id)
@@ -440,30 +512,203 @@ def respond_to_supplier(session_id, supplier_id):
         price_mentioned=extract_price_from_message(response) or price
     )
     db.session.add(msg)
+    db.session.commit()
     
-    # Auto-generate buyer response if not final round
-    if supplier.negotiation_round < 2:
-        supplier.negotiation_round += 1
-        
-        # Generate buyer's negotiation response
-        buyer_response = generate_negotiation_response(
-            supplier.messages + [msg],
-            requirements,
-            supplier.negotiation_round
-        )
-        
-        buyer_msg = Message(
-            supplier_id=supplier_id,
-            sender='buyer',
-            content=buyer_response
-        )
-        db.session.add(buyer_msg)
-    else:
-        # Final round - update final price
-        supplier.final_price = extract_price_from_message(response) or price
+    # Return the supplier's response
+    return jsonify({
+        'success': True,
+        'supplier_message': {
+            'content': response,
+            'price_mentioned': extract_price_from_message(response) or price
+        }
+    })
+
+# Add these new routes to your existing quote_bp
+
+# Add this route to your quote_bp in the Python file
+
+@quote_bp.route('/negotiate/<int:session_id>/send-initial/<int:supplier_id>', methods=['POST'])
+def send_initial_message(session_id, supplier_id):
+    """Send initial message to supplier (allows user to edit before sending)"""
+    
+    data = request.json
+    message_content = data.get('content')
+    
+    if not message_content:
+        return jsonify({'error': 'Message content is required'}), 400
+    
+    session = NegotiationSession.query.get_or_404(session_id)
+    supplier = Supplier.query.get_or_404(supplier_id)
+    
+    # Check if initial message already exists
+    existing_messages = Message.query.filter_by(
+        supplier_id=supplier_id
+    ).count()
+    
+    if existing_messages > 0:
+        # Clear existing messages if we're resending initial
+        Message.query.filter_by(supplier_id=supplier_id).delete()
+    
+    # Save the initial message
+    msg = Message(
+        supplier_id=supplier_id,
+        sender='buyer',
+        content=message_content
+    )
+    db.session.add(msg)
+    
+    # Set supplier status
+    supplier.status = 'pending'
+    supplier.negotiation_round = 0
     
     db.session.commit()
-    return jsonify({'success': True})
+    
+    return jsonify({
+        'success': True,
+        'message': {
+            'id': msg.id,
+            'content': message_content,
+            'created_at': msg.created_at.isoformat()
+        }
+    })
+
+@quote_bp.route('/negotiate/<int:session_id>/get-supplier-response/<int:supplier_id>', methods=['POST'])
+def get_supplier_response(session_id, supplier_id):
+    """Generate and save supplier response only"""
+    
+    session = NegotiationSession.query.get_or_404(session_id)
+    supplier = Supplier.query.get_or_404(supplier_id)
+    requirements = json.loads(session.extracted_requirements)
+    
+    # Check if supplier has initial message from buyer
+    buyer_messages = Message.query.filter_by(
+        supplier_id=supplier_id, sender='buyer'
+    ).count()
+    
+    if buyer_messages == 0:
+        return jsonify({'error': 'No initial message sent to supplier yet'}), 400
+    
+    # Check if this is initial response or negotiation
+    supplier_messages = Message.query.filter_by(
+        supplier_id=supplier_id, sender='supplier'
+    ).count()
+    
+    if supplier_messages == 0:
+        # Generate initial quote
+        response, price = generate_supplier_response(
+            supplier.company_name,
+            requirements,
+            supplier.messages,
+            0,
+            session.target_price
+        )
+        
+        supplier.initial_price = price
+        supplier.status = 'negotiating'
+    else:
+        # Generate negotiation response
+        response, price = generate_supplier_response(
+            supplier.company_name,
+            requirements,
+            supplier.messages,
+            supplier.negotiation_round,
+            session.target_price
+        )
+    
+    # Save supplier message
+    msg = Message(
+        supplier_id=supplier_id,
+        sender='supplier',
+        content=response,
+        price_mentioned=extract_price_from_message(response) or price
+    )
+    db.session.add(msg)
+    db.session.commit()
+    
+    # Return the supplier's response
+    return jsonify({
+        'success': True,
+        'supplier_message': {
+            'id': msg.id,
+            'content': response,
+            'price_mentioned': extract_price_from_message(response) or price,
+            'created_at': msg.created_at.isoformat()
+        },
+        'can_negotiate': supplier.negotiation_round < 2
+    })
+
+@quote_bp.route('/negotiate/<int:session_id>/draft/<int:supplier_id>', methods=['POST'])
+def generate_draft_response(session_id, supplier_id):
+    """Generate a draft buyer response for user to review/edit"""
+    
+    session = NegotiationSession.query.get_or_404(session_id)
+    supplier = Supplier.query.get_or_404(supplier_id)
+    requirements = json.loads(session.extracted_requirements)
+    
+    # Get all messages including the latest supplier message
+    messages = Message.query.filter_by(supplier_id=supplier_id).order_by(Message.created_at).all()
+    
+    # Determine negotiation round
+    supplier_message_count = len([m for m in messages if m.sender == 'supplier'])
+    current_round = min(supplier_message_count, 2)  # Max 2 rounds of negotiation
+    
+    # Generate draft response
+    draft_response = generate_negotiation_response(
+        messages,
+        requirements,
+        current_round
+    )
+    
+    return jsonify({
+        'success': True,
+        'draft': draft_response,
+        'round': current_round,
+        'is_final_round': current_round >= 2
+    })
+
+@quote_bp.route('/negotiate/<int:session_id>/send/<int:supplier_id>', methods=['POST'])
+def send_buyer_response(session_id, supplier_id):
+    """Send the user's edited response to supplier"""
+    
+    data = request.json
+    response_content = data.get('content')
+    
+    if not response_content:
+        return jsonify({'error': 'Response content is required'}), 400
+    
+    supplier = Supplier.query.get_or_404(supplier_id)
+    
+    # Save the buyer's message
+    msg = Message(
+        supplier_id=supplier_id,
+        sender='buyer',
+        content=response_content
+    )
+    db.session.add(msg)
+    
+    # Update negotiation round
+    supplier_message_count = Message.query.filter_by(
+        supplier_id=supplier_id, sender='supplier'
+    ).count()
+    supplier.negotiation_round = min(supplier_message_count, 2)
+    
+    # If this is the final round, mark for completion
+    if supplier.negotiation_round >= 2:
+        # Get the last supplier price for final price
+        last_supplier_msg = Message.query.filter_by(
+            supplier_id=supplier_id, sender='supplier'
+        ).order_by(Message.created_at.desc()).first()
+        
+        if last_supplier_msg and last_supplier_msg.price_mentioned:
+            supplier.final_price = last_supplier_msg.price_mentioned
+    
+    db.session.commit()
+    
+    return jsonify({
+        'success': True,
+        'negotiation_round': supplier.negotiation_round,
+        'can_continue': supplier.negotiation_round < 2
+    })
 
 @quote_bp.route('/negotiate/<int:session_id>/accept/<int:supplier_id>', methods=['POST'])
 def accept_quote(session_id, supplier_id):
