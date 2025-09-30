@@ -45,7 +45,7 @@ CORS(app, resources={
         ]
     }
 })
-openai_client = OpenAI(api_key="")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Your detailed instruction prompt
 SYSTEM_PROMPT = {

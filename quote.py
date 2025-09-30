@@ -13,7 +13,7 @@ load_dotenv()
 quote_bp = Blueprint('quote', __name__, url_prefix='/api')
 
 # Initialize OpenAI client
-client = OpenAI(api_key="")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # We'll use the app's db instance
 db = None
