@@ -10,6 +10,11 @@ import json
 import re
 from flask_cors import CORS
 from quote import quote_bp, init_db
+from notifications import notifications_bp, init_notifications_db
+from compliance import compliance_bp, init_compliance_db
+from pdf_generator import pdf_bp, init_pdf_db
+from email_webhook import webhook_bp, init_webhook_db
+from background_jobs import init_background_jobs, get_scheduler_status, start_negotiation_for_session
 
 load_dotenv()
 app = Flask(__name__)
@@ -23,9 +28,42 @@ db = SQLAlchemy(app)
 # Initialize the quote blueprint with the database
 init_db(db)
 
-# Register the blueprint
+# Initialize the notifications blueprint with the database
+init_notifications_db(db)
+
+# Initialize the compliance blueprint with the database
+init_compliance_db(db)
+
+# Initialize the PDF blueprint with the database
+init_pdf_db(db)
+
+# Register the blueprints
 app.register_blueprint(quote_bp)
+app.register_blueprint(notifications_bp)
+app.register_blueprint(compliance_bp)
+app.register_blueprint(pdf_bp)
+app.register_blueprint(webhook_bp)
+
 from quote import NegotiationSession, Supplier, Message
+from notifications import Notification
+
+# Initialize webhook after models are available
+init_webhook_db(db, Supplier, Message, NegotiationSession)
+
+
+# Background job control routes
+@app.route('/api/jobs/status', methods=['GET'])
+def job_status():
+    """Get background job scheduler status"""
+    status = get_scheduler_status()
+    return jsonify(status)
+
+
+@app.route('/api/jobs/process-session/<int:session_id>', methods=['POST'])
+def process_session(session_id):
+    """Manually trigger processing for a negotiation session"""
+    result = start_negotiation_for_session(session_id)
+    return jsonify(result)
 
 
 CORS(app, resources={
@@ -36,16 +74,27 @@ CORS(app, resources={
             "https://gov-ai-frontend.vercel.app"           # deployed frontend
         ]
     },
-    r"/api/*": {  # This covers all quote blueprint routes
+    r"/api/*": {  # This covers all quote and notifications blueprint routes
         "origins": [
             "http://localhost:3000",                      # Next.js local dev
             "http://localhost:9002",                      # your existing local dev
             "https://gov-ai-frontend.vercel.app",         # deployed frontend
             "*"  # You can restrict this in production
         ]
+    },
+    r"/message-chat": {
+        "origins": [
+            "http://localhost:3000",
+            "http://localhost:9002",
+            "https://gov-ai-frontend.vercel.app",
+            "*"
+        ]
+    },
+    r"/webhook/*": {  # Email webhook endpoints
+        "origins": "*"
     }
 })
-openai_client = OpenAI(api_key="")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Your detailed instruction prompt
 SYSTEM_PROMPT = {
@@ -215,10 +264,57 @@ def analyze_solicitations():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/message-chat", methods=["POST"])
+def message_chat():
+    data = request.get_json()
+    
+    summary = data.get("summary")
+    chat_history = data.get("chatHistory", [])
+    user_message = data.get("userMessage")
+    
+    if not user_message:
+        return jsonify({"error": "Missing 'userMessage' field."}), 400
+    
+    # Build conversation context
+    system_message = f"""You are a helpful government contracting assistant. You have access to the following contract summary information:
+
+{json.dumps(summary, indent=2) if summary else "No summary available."}
+
+Use this context to answer questions about the contract. Be helpful, accurate, and concise. If you don't know something or it's not in the provided context, say so."""
+
+    # Build messages array for OpenAI
+    messages = [{"role": "system", "content": system_message}]
+    
+    # Add chat history
+    for msg in chat_history:
+        role = "assistant" if msg.get("role") == "agent" else "user"
+        messages.append({"role": role, "content": msg.get("content", "")})
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=1000,
+            temperature=0.7
+        )
+        
+        assistant_message = response.choices[0].message.content
+        return jsonify({"message": assistant_message})
+    
+    except Exception as e:
+        print(f"Error in message-chat: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     with app.app_context():
         # Import models first
         from quote import NegotiationSession, Supplier, Message
         db.create_all()
+        
+        # Initialize background jobs
+        init_background_jobs(db, Supplier, Message, NegotiationSession, app.app_context)
+    
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 9000)), debug=True)
 
