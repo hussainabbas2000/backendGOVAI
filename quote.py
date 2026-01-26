@@ -315,6 +315,54 @@ def extract_price_from_message(content):
 
 # Routes
 
+@quote_bp.route('/sam-gov/dashboard-stats', methods=['GET'])
+def get_dashboard_stats():
+    """Get dashboard statistics from negotiations data"""
+    try:
+        # Get all sessions
+        sessions = NegotiationSession.query.all()
+        
+        # Calculate stats
+        total_sessions = len(sessions)
+        active_negotiations = sum(1 for s in sessions if s.status == 'active')
+        bids_submitted = sum(1 for s in sessions if s.status == 'bid_submitted')
+        completed_negotiations = sum(1 for s in sessions if s.status == 'completed')
+        
+        # Calculate total value (target prices)
+        total_target_value = sum(s.target_price for s in sessions if s.target_price)
+        
+        # Get supplier stats
+        all_suppliers = Supplier.query.all()
+        total_suppliers = len(all_suppliers)
+        suppliers_with_responses = sum(1 for s in all_suppliers if s.status in ['negotiating', 'completed'])
+        
+        # Calculate savings from completed negotiations
+        total_savings = 0
+        for supplier in all_suppliers:
+            if supplier.initial_price and supplier.final_price:
+                total_savings += supplier.initial_price - supplier.final_price
+        
+        # Get recent activity (sessions in last 7 days)
+        from datetime import timedelta
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        recent_sessions = sum(1 for s in sessions if s.created_at and s.created_at > week_ago)
+        
+        return jsonify({
+            'stats': {
+                'active_negotiations': active_negotiations,
+                'bids_submitted': bids_submitted,
+                'completed_negotiations': completed_negotiations,
+                'total_sessions': total_sessions,
+                'total_target_value': total_target_value,
+                'total_suppliers_engaged': total_suppliers,
+                'suppliers_responded': suppliers_with_responses,
+                'total_savings': total_savings,
+                'recent_activity': recent_sessions
+            }
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @quote_bp.route('/sam-gov/sessions', methods=['GET'])
 def get_all_sessions():
     """Get all negotiation sessions"""
@@ -1039,7 +1087,9 @@ def generate_vendor_recommendations(vendor_data, requirements, target_price, opp
     
     # Build comparison prompt
     vendor_summary = "\n".join([
-        f"- {v['company_name']}: Price ${v['current_price']:.2f if v['current_price'] else 'N/A'}, Status: {v['status']}, Rounds: {v['negotiation_round']}"
+        f"- {v['company_name']}: Price ${v['current_price']:.2f}, Status: {v['status']}, Rounds: {v['negotiation_round']}" 
+        if v['current_price'] is not None 
+        else f"- {v['company_name']}: Price N/A, Status: {v['status']}, Rounds: {v['negotiation_round']}"
         for v in vendor_data
     ])
     

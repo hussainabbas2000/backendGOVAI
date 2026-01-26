@@ -207,22 +207,134 @@ def download_and_upload_files(urls):
                 tmp.write(response.content)
                 tmp_path = tmp.name
 
-            # Upload to OpenAI
-            upload = openai_client.files.create(
-                file=open(tmp_path, "rb"),
-                purpose="user_data"
-            )
+            # Upload to OpenAI - use context manager to properly close file
+            with open(tmp_path, "rb") as f:
+                upload = openai_client.files.create(
+                    file=f,
+                    purpose="user_data"
+                )
 
             uploaded_files.append({
                 "type": "input_file",
                 "file_id": upload.id
             })
 
-            os.unlink(tmp_path)
+            # Now safe to delete - file handle is closed
+            try:
+                os.unlink(tmp_path)
+            except Exception as del_err:
+                print(f"Warning: Could not delete temp file {tmp_path}: {del_err}")
 
         except Exception as e:
             print(f"Error downloading or uploading file from {url}: {e}")
     return uploaded_files
+
+
+# Prompt for extracting key info from a single document
+EXTRACTION_PROMPT = """
+Extract the following key information from this document in JSON format:
+- solicitation_number
+- naics_codes (list)
+- psc_fsc_code
+- set_aside_type
+- contract_type
+- response_deadline
+- submission_method
+- evaluation_criteria
+- product_service_description
+- quantity_units_delivery
+- contracting_officer_contact
+- far_clauses (list)
+- key_requirements (list of strings)
+
+If any field is not found, use null. Return ONLY valid JSON, no other text.
+"""
+
+# Prompt for combining extracted data into final summary
+FINAL_SUMMARY_PROMPT = """
+Based on the following extracted data from multiple solicitation documents, create a comprehensive analysis following this structure:
+
+**Extracted Data:**
+{extracted_data}
+
+**Original System Instructions:**
+""" + SYSTEM_PROMPT["text"] + """
+
+Combine all the extracted information into a single cohesive summary. Return your response as valid JSON.
+"""
+
+
+def analyze_single_document(file_input):
+    """Analyze a single document and extract key information"""
+    try:
+        response = openai_client.responses.create(
+            model="gpt-4o-mini",  # Use mini for individual doc extraction (cheaper & faster)
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        file_input,
+                        {"type": "input_text", "text": EXTRACTION_PROMPT}
+                    ]
+                }
+            ]
+        )
+        raw_output = response.output_text
+        # Try to parse JSON
+        try:
+            # Clean up the response - remove markdown code blocks if present
+            cleaned = raw_output.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            return json.loads(cleaned.strip())
+        except:
+            return {"raw_text": raw_output}
+    except Exception as e:
+        print(f"Error analyzing document: {e}")
+        return {"error": str(e)}
+
+
+def create_final_summary(extracted_data_list):
+    """Combine extracted data from all documents into final summary"""
+    try:
+        combined_data = json.dumps(extracted_data_list, indent=2)
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",  # Use full model for final synthesis
+            messages=[
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT["text"]
+                },
+                {
+                    "role": "user", 
+                    "content": f"Here is the extracted data from the solicitation documents:\n\n{combined_data}\n\nPlease provide the full analysis as per your instructions. Return valid JSON only."
+                }
+            ],
+            max_tokens=4000,
+            temperature=0.3
+        )
+        
+        raw_output = response.choices[0].message.content
+        # Clean and parse
+        cleaned = raw_output.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        if cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        return json.loads(cleaned.strip())
+    except json.JSONDecodeError:
+        return {"raw_output": raw_output}
+    except Exception as e:
+        print(f"Error creating final summary: {e}")
+        return {"error": str(e)}
+
 
 @app.route("/analyze-solicitations", methods=["POST"])
 def analyze_solicitations():
@@ -232,37 +344,31 @@ def analyze_solicitations():
     if not urls or not isinstance(urls, list):
         return jsonify({"error": "Missing or invalid 'urls' array."}), 400
 
+    print(f"Processing {len(urls)} documents in batches...")
+    
     # Upload files to OpenAI
     file_inputs = download_and_upload_files(urls)
     if not file_inputs:
         return jsonify({"error": "Failed to upload any files."}), 500
 
-    # Add system prompt
-    input_payload = file_inputs + [SYSTEM_PROMPT]
-
+    # Step 1: Process each document separately to extract key info
+    print("Step 1: Extracting key information from each document...")
+    extracted_data = []
+    for i, file_input in enumerate(file_inputs):
+        print(f"  Processing document {i+1}/{len(file_inputs)}...")
+        doc_data = analyze_single_document(file_input)
+        doc_data["document_index"] = i + 1
+        extracted_data.append(doc_data)
+    
+    print(f"Extracted data from {len(extracted_data)} documents")
+    
+    # Step 2: Combine all extracted data into final summary
+    print("Step 2: Creating final comprehensive summary...")
     try:
-        response = openai_client.responses.create(
-            model="gpt-4.1",  # Or "gpt-4o" if supported
-            input=[
-                {
-                    "role": "user",
-                    "content": input_payload
-                }
-            ]
-        )
-        raw_output = response.output_text
-        try:
-            parsed_data = parse_raw_output(raw_output)
-            return parsed_data
-        except json.JSONDecodeError as e:
-            return jsonify({
-                "error": "Failed to parse JSON",
-                "details": str(e),
-                "raw_output": raw_output
-            }), 502
-
+        final_summary = create_final_summary(extracted_data)
+        return jsonify(final_summary)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "extracted_data": extracted_data}), 500
 
 
 @app.route("/message-chat", methods=["POST"])
