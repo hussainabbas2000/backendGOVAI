@@ -71,14 +71,14 @@ CORS(app, resources={
         "origins": [
             "http://localhost:9002",                     # local dev
             r"^http://127\.0\.0\.1(:[0-9]+)?$",
-            "https://gov-ai-frontend.vercel.app"           # deployed frontend
+            "https://sam-gov-liard.vercel.app"              # deployed frontend
         ]
     },
     r"/api/*": {  # This covers all quote and notifications blueprint routes
         "origins": [
             "http://localhost:3000",                      # Next.js local dev
             "http://localhost:9002",                      # your existing local dev
-            "https://gov-ai-frontend.vercel.app",         # deployed frontend
+            "https://sam-gov-liard.vercel.app",            # deployed frontend
             "*"  # You can restrict this in production
         ]
     },
@@ -86,7 +86,7 @@ CORS(app, resources={
         "origins": [
             "http://localhost:3000",
             "http://localhost:9002",
-            "https://gov-ai-frontend.vercel.app",
+            "https://sam-gov-liard.vercel.app",
             "*"
         ]
     },

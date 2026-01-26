@@ -397,7 +397,7 @@ def _build_notification_html(user_name, notification_type, content):
                 {body}
                 
                 <p style="text-align: center; margin-top: 30px;">
-                    <a href="{os.getenv('FRONTEND_URL', 'http://localhost:9002')}" class="button">View in Dashboard</a>
+                    <a href="https://sam-gov-liard.vercel.app" class="button">View in Dashboard</a>
                 </p>
             </div>
             <div class="footer">
