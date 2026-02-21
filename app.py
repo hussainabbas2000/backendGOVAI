@@ -1,4 +1,5 @@
 import os
+import io
 import tempfile
 import requests
 from flask import Flask, request, jsonify, Blueprint
@@ -14,6 +15,7 @@ from notifications import notifications_bp, init_notifications_db
 from compliance import compliance_bp, init_compliance_db
 from pdf_generator import pdf_bp, init_pdf_db
 from email_webhook import webhook_bp, init_webhook_db
+from email_poller import init_poller_db
 from background_jobs import init_background_jobs, get_scheduler_status, start_negotiation_for_session
 from suggestions import suggestions_bp
 
@@ -51,6 +53,9 @@ from notifications import Notification
 
 # Initialize webhook after models are available
 init_webhook_db(db, Supplier, Message, NegotiationSession)
+
+# Initialize Gmail inbox poller
+init_poller_db(db, Supplier, Message, NegotiationSession)
 
 
 # Background job control routes
@@ -198,18 +203,145 @@ def parse_raw_output(raw_output):
         print("Failed to parse raw_output:", e)
         return None
 
+def _detect_file_type(url, content_type):
+    """Detect file type from URL extension and Content-Type header."""
+    from urllib.parse import urlparse
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    
+    type_map = {
+        '.pdf': 'pdf',
+        '.docx': 'docx',
+        '.doc': 'doc',
+        '.xlsx': 'xlsx',
+        '.xls': 'xls',
+        '.html': 'html',
+        '.htm': 'html',
+        '.txt': 'txt',
+        '.csv': 'csv',
+    }
+    if ext in type_map:
+        return type_map[ext]
+    
+    ct = (content_type or '').lower()
+    if 'pdf' in ct:
+        return 'pdf'
+    if 'wordprocessingml' in ct or 'msword' in ct:
+        return 'docx'
+    if 'spreadsheetml' in ct or 'ms-excel' in ct:
+        return 'xlsx'
+    if 'html' in ct:
+        return 'html'
+    if 'text/plain' in ct or 'text/csv' in ct:
+        return 'txt'
+    
+    return 'unknown'
+
+
+def _convert_to_pdf(file_content, file_type):
+    """Convert non-PDF file content to PDF bytes. Returns PDF bytes or None."""
+    try:
+        if file_type == 'docx':
+            from docx import Document
+            doc = Document(io.BytesIO(file_content))
+            paragraphs = []
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if text:
+                    escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    paragraphs.append(f"<p>{escaped}</p>")
+            
+            for table in doc.tables:
+                paragraphs.append("<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;width:100%'>")
+                for row in table.rows:
+                    paragraphs.append("<tr>")
+                    for cell in row.cells:
+                        cell_text = cell.text.strip().replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        paragraphs.append(f"<td>{cell_text}</td>")
+                    paragraphs.append("</tr>")
+                paragraphs.append("</table>")
+            
+            html = f"<html><body style='font-family:Arial,sans-serif;font-size:11pt;line-height:1.5'>{''.join(paragraphs)}</body></html>"
+        
+        elif file_type in ('xlsx', 'xls', 'csv'):
+            if file_type == 'csv':
+                import csv as csv_module
+                reader = csv_module.reader(io.StringIO(file_content.decode('utf-8', errors='replace')))
+                rows = list(reader)
+                table_html = "<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;width:100%'>"
+                for row in rows:
+                    table_html += "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>"
+                table_html += "</table>"
+                html = f"<html><body style='font-family:Arial,sans-serif;font-size:10pt'>{table_html}</body></html>"
+            else:
+                from openpyxl import load_workbook
+                wb = load_workbook(io.BytesIO(file_content), read_only=True, data_only=True)
+                sheets_html = []
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    sheets_html.append(f"<h2>{sheet_name}</h2>")
+                    sheets_html.append("<table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;width:100%'>")
+                    for row in ws.iter_rows(values_only=True):
+                        sheets_html.append("<tr>")
+                        for cell in row:
+                            val = str(cell) if cell is not None else ""
+                            val = val.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                            sheets_html.append(f"<td>{val}</td>")
+                        sheets_html.append("</tr>")
+                    sheets_html.append("</table>")
+                wb.close()
+                html = f"<html><body style='font-family:Arial,sans-serif;font-size:10pt'>{''.join(sheets_html)}</body></html>"
+        
+        elif file_type == 'html':
+            html = file_content.decode('utf-8', errors='replace')
+        
+        elif file_type == 'txt':
+            text = file_content.decode('utf-8', errors='replace')
+            escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            html = f"<html><body style='font-family:monospace;font-size:10pt;white-space:pre-wrap'>{escaped}</body></html>"
+        
+        else:
+            return None
+        
+        from weasyprint import HTML
+        pdf_bytes = HTML(string=html).write_pdf()
+        return pdf_bytes
+    
+    except Exception as e:
+        print(f"Error converting {file_type} to PDF: {e}")
+        return None
+
+
 def download_and_upload_files(urls):
     uploaded_files = []
     for url in urls:
         try:
             response = requests.get(url)
             response.raise_for_status()
+            
+            content_type = response.headers.get('Content-Type', '')
+            file_type = _detect_file_type(url, content_type)
+            print(f"  File type detected: {file_type} for {url[:80]}...")
+            
+            if file_type == 'pdf':
+                file_bytes = response.content
+            elif file_type == 'unknown':
+                # Try treating as PDF first (some servers don't set proper Content-Type)
+                if response.content[:5] == b'%PDF-':
+                    file_bytes = response.content
+                else:
+                    print(f"  Skipping unsupported file type for: {url[:80]}")
+                    continue
+            else:
+                file_bytes = _convert_to_pdf(response.content, file_type)
+                if not file_bytes:
+                    print(f"  Failed to convert {file_type} to PDF for: {url[:80]}")
+                    continue
+                print(f"  Converted {file_type} to PDF ({len(file_bytes)} bytes)")
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(response.content)
+                tmp.write(file_bytes)
                 tmp_path = tmp.name
 
-            # Upload to OpenAI - use context manager to properly close file
             with open(tmp_path, "rb") as f:
                 upload = openai_client.files.create(
                     file=f,
@@ -221,7 +353,6 @@ def download_and_upload_files(urls):
                 "file_id": upload.id
             })
 
-            # Now safe to delete - file handle is closed
             try:
                 os.unlink(tmp_path)
             except Exception as del_err:
@@ -362,12 +493,17 @@ def analyze_solicitations():
         doc_data["document_index"] = i + 1
         extracted_data.append(doc_data)
     
-    print(f"Extracted data from {len(extracted_data)} documents")
+    # Filter out documents that failed to analyze
+    successful_data = [d for d in extracted_data if "error" not in d]
+    print(f"Extracted data from {len(successful_data)}/{len(extracted_data)} documents (skipped {len(extracted_data) - len(successful_data)} failures)")
+    
+    if not successful_data:
+        return jsonify({"error": "All documents failed to analyze."}), 500
     
     # Step 2: Combine all extracted data into final summary
     print("Step 2: Creating final comprehensive summary...")
     try:
-        final_summary = create_final_summary(extracted_data)
+        final_summary = create_final_summary(successful_data)
         return jsonify(final_summary)
     except Exception as e:
         return jsonify({"error": str(e), "extracted_data": extracted_data}), 500
@@ -424,5 +560,5 @@ if __name__ == "__main__":
         # Initialize background jobs
         init_background_jobs(db, Supplier, Message, NegotiationSession, app.app_context)
     
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 9000)), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 9000)), debug=True, use_reloader=False)
 

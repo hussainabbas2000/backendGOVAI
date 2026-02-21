@@ -138,22 +138,38 @@ def extract_price_from_text(text: str) -> float:
 
 
 def find_supplier_by_email(email_address: str):
-    """Find supplier by email address"""
+    """Find the most recent supplier with this email that was actually sent an RFQ."""
     if not Supplier:
         return None
     
-    # Try exact match first
-    supplier = Supplier.query.filter_by(email=email_address).first()
+    # Match the most recent supplier that has email_sent=True (actively awaiting reply)
+    supplier = (
+        Supplier.query
+        .filter_by(email=email_address, email_sent=True)
+        .order_by(Supplier.id.desc())
+        .first()
+    )
+    
+    if supplier:
+        return supplier
+    
+    # Fallback: most recent supplier with this email (any state)
+    supplier = (
+        Supplier.query
+        .filter_by(email=email_address)
+        .order_by(Supplier.id.desc())
+        .first()
+    )
     
     if not supplier:
-        # Try domain match for common variations
         domain = email_address.split('@')[1] if '@' in email_address else None
         if domain:
-            suppliers = Supplier.query.all()
-            for s in suppliers:
-                if s.email and domain in s.email:
-                    supplier = s
-                    break
+            supplier = (
+                Supplier.query
+                .filter(Supplier.email.contains(domain))
+                .order_by(Supplier.id.desc())
+                .first()
+            )
     
     return supplier
 
@@ -165,10 +181,23 @@ def create_message_from_email(supplier_id: int, parsed_data: dict, raw_content: 
         return {'error': 'Database not initialized'}
     
     try:
+        # Duplicate detection: skip if an identical supplier message was created recently
+        from datetime import timedelta
+        cutoff = datetime.utcnow() - timedelta(minutes=5)
+        duplicate = Message.query.filter(
+            Message.supplier_id == supplier_id,
+            Message.sender == 'supplier',
+            Message.content == raw_content,
+            Message.created_at >= cutoff
+        ).first()
+        if duplicate:
+            print(f"[EmailWebhook] Skipping duplicate message for supplier {supplier_id}")
+            return {'message_id': duplicate.id, 'supplier_id': supplier_id, 'duplicate': True}
+        
         msg = Message(
             supplier_id=supplier_id,
             sender='supplier',
-            content=parsed_data.get('summary', raw_content[:500]),
+            content=raw_content,
             price_mentioned=parsed_data.get('total_price')
         )
         db.session.add(msg)

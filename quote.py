@@ -241,37 +241,52 @@ def generate_supplier_response(company_name, requirements, messages, round_num, 
     return response.choices[0].message.content, suggested_price
 
 def generate_negotiation_response(messages, requirements, round_num):
-    """Generate buyer's negotiation response without revealing target price"""
+    """Generate buyer's negotiation response that engages with the vendor's actual points"""
     
-    history = "\n".join([f"{m.sender}: {m.content}" for m in messages[-3:]])
+    # Include full conversation history (truncate individual messages if very long)
+    history_parts = []
+    for m in messages:
+        content = m.content if len(m.content) <= 1500 else m.content[:1500] + "..."
+        label = "BUYER" if m.sender == "buyer" else "VENDOR"
+        history_parts.append(f"[{label}]: {content}")
+    full_history = "\n\n".join(history_parts)
     
-    prompt = f"""
-    You are negotiating a government contract for: {requirements['product_service']}
-    This is negotiation round {round_num} of maximum 2.
+    # Extract the vendor's latest message explicitly
+    vendor_messages = [m for m in messages if m.sender == 'supplier']
+    latest_vendor_msg = vendor_messages[-1].content if vendor_messages else "No vendor response yet."
     
-    Previous conversation:
-    {history}
+    is_final = round_num >= 2
     
-    Guidelines:
-    - Round 1: Express that pricing exceeds available budget, ask for better terms
-    - Round 2: Final negotiation, mention competitive bids received, ask for best and final
-    
-    Important:
-    - NEVER mention specific budget numbers or target prices
-    - Reference "budget constraints" or "competitive pricing" instead
-    - Mention you're evaluating multiple qualified suppliers
-    - Ask about additional value adds or services
-    
-    Be professional and keep under 150 words.
-    """
+    prompt = f"""You are a government procurement specialist writing a follow-up email to a vendor
+about: {requirements.get('product_service', 'a government contract')}.
+
+FULL CONVERSATION SO FAR:
+{full_history}
+
+THE VENDOR'S LATEST MESSAGE (you MUST address this directly):
+{latest_vendor_msg}
+
+YOUR TASK - Write a professional reply that:
+1. FIRST: Directly acknowledge and respond to the specific points, questions, or concerns the vendor raised in their latest message. If they asked questions, answer them. If they made counterpoints, address them.
+2. THEN: Naturally steer the conversation toward more favorable pricing or terms.
+{"3. This is your final opportunity to negotiate. Ask for their best and final offer." if is_final else "3. Explore whether there is flexibility on pricing, delivery timelines, or added value."}
+
+RULES:
+- NEVER reveal specific budget numbers or target prices
+- You may reference "budget constraints" or "other competitive proposals"
+- Sound like a real person, not a template. Vary your language.
+- Be respectful and collaborative, not adversarial
+- Keep under 300 words
+- Do NOT include subject lines, greetings like "Dear...", or sign-offs like "Best regards" — those are added separately
+"""
     
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "You are a government procurement negotiator. Never reveal budget numbers."},
+            {"role": "system", "content": "You are an experienced government procurement negotiator. You write natural, professional emails that engage with what the other party actually said. You never sound robotic or repetitive."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.7
+        temperature=0.75
     )
     
     return response.choices[0].message.content
@@ -595,6 +610,7 @@ def get_negotiation_status(session_id):
             'email': s.email,
             'notes': s.notes,
             'is_manual': s.is_manual,
+            'email_sent': s.email_sent or False,
             'status': s.status,
             'negotiation_round': s.negotiation_round,
             'messages': [{
@@ -689,13 +705,39 @@ def respond_to_supplier(session_id, supplier_id):
     supplier = Supplier.query.get_or_404(supplier_id)
     requirements = json.loads(session.extracted_requirements)
     
-    # Check if this is initial response or negotiation
+    # If a real email was sent, don't generate simulated responses.
+    # Wait for the email poller to pick up the real vendor reply.
+    if supplier.email_sent:
+        existing_supplier_msgs = Message.query.filter_by(
+            supplier_id=supplier_id, sender='supplier'
+        ).order_by(Message.created_at.desc()).all()
+        
+        buyer_msg_count = Message.query.filter_by(
+            supplier_id=supplier_id, sender='buyer'
+        ).count()
+        
+        if len(existing_supplier_msgs) >= buyer_msg_count:
+            latest = existing_supplier_msgs[0]
+            return jsonify({
+                'success': True,
+                'supplier_message': {
+                    'content': latest.content,
+                    'price_mentioned': latest.price_mentioned
+                }
+            })
+        
+        return jsonify({
+            'success': False,
+            'waiting_for_email': True,
+            'message': 'Waiting for vendor to reply by email'
+        })
+    
+    # No real email sent — generate AI-simulated response
     supplier_messages = Message.query.filter_by(
         supplier_id=supplier_id, sender='supplier'
     ).count()
     
     if supplier_messages == 0:
-        # Generate initial quote
         response, price = generate_supplier_response(
             supplier.company_name,
             requirements,
@@ -707,7 +749,6 @@ def respond_to_supplier(session_id, supplier_id):
         supplier.initial_price = price
         supplier.status = 'negotiating'
     else:
-        # Generate negotiation response
         response, price = generate_supplier_response(
             supplier.company_name,
             requirements,
@@ -716,7 +757,6 @@ def respond_to_supplier(session_id, supplier_id):
             session.target_price
         )
     
-    # Save supplier message
     msg = Message(
         supplier_id=supplier_id,
         sender='supplier',
@@ -726,7 +766,6 @@ def respond_to_supplier(session_id, supplier_id):
     db.session.add(msg)
     db.session.commit()
     
-    # Return the supplier's response
     return jsonify({
         'success': True,
         'supplier_message': {
@@ -795,8 +834,12 @@ def send_initial_message(session_id, supplier_id):
                 supplier.email_sent = True
                 supplier.email_sent_at = datetime.utcnow()
                 supplier.last_email_message_id = email_result.get('message_id')
+                print(f"[SendInitial] Email to {supplier.email}: SUCCESS, message_id={email_result.get('message_id')}")
+            else:
+                print(f"[SendInitial] Email to {supplier.email}: FAILED - {email_result.get('error')}")
         except Exception as e:
             email_result = {'success': False, 'error': str(e)}
+            print(f"[SendInitial] Email to {supplier.email}: EXCEPTION - {e}")
     
     db.session.commit()
     
@@ -819,7 +862,6 @@ def get_supplier_response(session_id, supplier_id):
     supplier = Supplier.query.get_or_404(supplier_id)
     requirements = json.loads(session.extracted_requirements)
     
-    # Check if supplier has initial message from buyer
     buyer_messages = Message.query.filter_by(
         supplier_id=supplier_id, sender='buyer'
     ).count()
@@ -827,13 +869,38 @@ def get_supplier_response(session_id, supplier_id):
     if buyer_messages == 0:
         return jsonify({'error': 'No initial message sent to supplier yet'}), 400
     
-    # Check if this is initial response or negotiation
+    # If a real email was sent, don't generate simulated responses.
+    # The email poller will create supplier messages when the vendor replies.
+    if supplier.email_sent:
+        existing_supplier_msgs = Message.query.filter_by(
+            supplier_id=supplier_id, sender='supplier'
+        ).order_by(Message.created_at.desc()).all()
+        
+        if len(existing_supplier_msgs) >= buyer_messages:
+            latest = existing_supplier_msgs[0]
+            return jsonify({
+                'success': True,
+                'supplier_message': {
+                    'id': latest.id,
+                    'content': latest.content,
+                    'price_mentioned': latest.price_mentioned,
+                    'created_at': latest.created_at.isoformat()
+                },
+                'can_negotiate': supplier.negotiation_round < 2
+            })
+        
+        return jsonify({
+            'success': False,
+            'waiting_for_email': True,
+            'message': 'Waiting for vendor to reply by email'
+        })
+    
+    # No real email sent — generate AI-simulated response
     supplier_messages = Message.query.filter_by(
         supplier_id=supplier_id, sender='supplier'
     ).count()
     
     if supplier_messages == 0:
-        # Generate initial quote
         response, price = generate_supplier_response(
             supplier.company_name,
             requirements,
@@ -845,7 +912,6 @@ def get_supplier_response(session_id, supplier_id):
         supplier.initial_price = price
         supplier.status = 'negotiating'
     else:
-        # Generate negotiation response
         response, price = generate_supplier_response(
             supplier.company_name,
             requirements,
@@ -854,7 +920,6 @@ def get_supplier_response(session_id, supplier_id):
             session.target_price
         )
     
-    # Save supplier message
     msg = Message(
         supplier_id=supplier_id,
         sender='supplier',
@@ -864,7 +929,6 @@ def get_supplier_response(session_id, supplier_id):
     db.session.add(msg)
     db.session.commit()
     
-    # Return the supplier's response
     return jsonify({
         'success': True,
         'supplier_message': {
@@ -941,10 +1005,11 @@ def send_buyer_response(session_id, supplier_id):
             email_result = send_negotiation_email(
                 to_email=supplier.email,
                 vendor_name=supplier.company_name,
-                subject=f"Re: Request for Quotation - {session.opportunity_title or 'Government Contract'} (Round {supplier.negotiation_round})",
+                subject=f"Re: Request for Quotation - {session.opportunity_title or 'Government Contract'}",
                 negotiation_content=response_content,
                 round_number=supplier.negotiation_round,
-                opportunity_title=session.opportunity_title
+                opportunity_title=session.opportunity_title,
+                in_reply_to=supplier.last_email_message_id
             )
             
             if email_result['success']:
