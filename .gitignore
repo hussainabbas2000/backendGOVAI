@@ -7,3 +7,6 @@ venv/
 instance/
 .env
 *.db
+gmail_token.json
+gmail_credentials.json
+client_secret_*.json

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import json
 import os
 from dotenv import load_dotenv
+from email_poller import init_poller_db, poll_inbox
 
 load_dotenv()
 
@@ -30,6 +31,9 @@ def init_background_jobs(database, supplier_model, message_model, session_model,
     Supplier = supplier_model
     Message = message_model
     NegotiationSession = session_model
+    
+    # Initialize email poller with database models
+    init_poller_db(database, supplier_model, message_model, session_model)
     
     # Create scheduler
     scheduler = BackgroundScheduler(daemon=True)
@@ -53,9 +57,19 @@ def init_background_jobs(database, supplier_model, message_model, session_model,
         replace_existing=True
     )
     
+    # Poll Gmail inbox for vendor replies
+    poll_interval = int(os.getenv('EMAIL_POLL_INTERVAL_SECONDS', '60'))
+    scheduler.add_job(
+        func=lambda: run_with_context(app_context, poll_inbox),
+        trigger=IntervalTrigger(seconds=poll_interval),
+        id='poll_email_inbox',
+        name='Poll Gmail inbox for vendor replies',
+        replace_existing=True
+    )
+    
     # Start the scheduler
     scheduler.start()
-    print("Background scheduler started")
+    print("Background scheduler started (with email polling)")
     
     return scheduler
 
@@ -238,10 +252,11 @@ def send_auto_counter_offer(supplier, session, requirements, messages):
             email_result = send_negotiation_email(
                 to_email=supplier.email,
                 vendor_name=supplier.company_name,
-                subject=f"Re: Request for Quotation - {session.opportunity_title} (Round {supplier.negotiation_round})",
+                subject=f"Re: Request for Quotation - {session.opportunity_title}",
                 negotiation_content=counter_content,
                 round_number=supplier.negotiation_round,
-                opportunity_title=session.opportunity_title
+                opportunity_title=session.opportunity_title,
+                in_reply_to=supplier.last_email_message_id
             )
             
             if email_result['success']:

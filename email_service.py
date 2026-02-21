@@ -5,7 +5,7 @@ Uses SendGrid for sending emails to vendors
 
 import os
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition, ReplyTo
+from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition, ReplyTo, Header
 from dotenv import load_dotenv
 import base64
 from datetime import datetime
@@ -33,7 +33,8 @@ def send_rfq_email(
     opportunity_title: str = None,
     opportunity_id: str = None,
     deadline: str = None,
-    attachments: list = None
+    attachments: list = None,
+    in_reply_to: str = None
 ) -> dict:
     """
     Send RFQ email to a vendor
@@ -71,6 +72,10 @@ def send_rfq_email(
         
         message.reply_to = ReplyTo(REPLY_TO_EMAIL)
         
+        if in_reply_to:
+            message.header = Header("In-Reply-To", f"<{in_reply_to}>")
+            message.header = Header("References", f"<{in_reply_to}>")
+        
         # Add plain text version
         plain_content = _build_rfq_plain_text(
             vendor_name=vendor_name,
@@ -96,6 +101,8 @@ def send_rfq_email(
         sg = get_sendgrid_client()
         response = sg.send(message)
         
+        print(f"[EmailService] Email sent to {to_email} - status: {response.status_code}, message_id: {response.headers.get('X-Message-Id')}")
+        
         return {
             'success': True,
             'status_code': response.status_code,
@@ -104,6 +111,7 @@ def send_rfq_email(
         }
         
     except Exception as e:
+        print(f"[EmailService] FAILED to send email to {to_email}: {e}")
         return {
             'success': False,
             'status_code': None,
@@ -118,27 +126,16 @@ def send_negotiation_email(
     subject: str,
     negotiation_content: str,
     round_number: int,
-    opportunity_title: str = None
+    opportunity_title: str = None,
+    in_reply_to: str = None
 ) -> dict:
     """
     Send negotiation round email to a vendor
-    
-    Args:
-        to_email: Vendor email address
-        vendor_name: Name of the vendor company
-        subject: Email subject line
-        negotiation_content: The negotiation message content
-        round_number: Current negotiation round (1 or 2)
-        opportunity_title: Title of the opportunity
-    
-    Returns:
-        dict with 'success', 'message_id', 'error' keys
     """
     try:
         html_content = _build_negotiation_html(
             vendor_name=vendor_name,
             negotiation_content=negotiation_content,
-            round_number=round_number,
             opportunity_title=opportunity_title
         )
         
@@ -150,8 +147,14 @@ def send_negotiation_email(
         )
         message.reply_to = ReplyTo(REPLY_TO_EMAIL)
         
+        if in_reply_to:
+            message.header = Header("In-Reply-To", f"<{in_reply_to}>")
+            message.header = Header("References", f"<{in_reply_to}>")
+        
         sg = get_sendgrid_client()
         response = sg.send(message)
+        
+        print(f"[EmailService] Negotiation email sent to {to_email} - status: {response.status_code}, message_id: {response.headers.get('X-Message-Id')}")
         
         return {
             'success': True,
@@ -161,6 +164,7 @@ def send_negotiation_email(
         }
         
     except Exception as e:
+        print(f"[EmailService] FAILED to send negotiation email to {to_email}: {e}")
         return {
             'success': False,
             'status_code': None,
@@ -302,8 +306,8 @@ To respond, please reply directly to this email.
     return text
 
 
-def _build_negotiation_html(vendor_name, negotiation_content, round_number, opportunity_title):
-    """Build HTML content for negotiation email"""
+def _build_negotiation_html(vendor_name, negotiation_content, opportunity_title):
+    """Build HTML content for negotiation follow-up email (matches RFQ style)"""
     return f"""
     <!DOCTYPE html>
     <html>
@@ -311,17 +315,15 @@ def _build_negotiation_html(vendor_name, negotiation_content, round_number, oppo
         <style>
             body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
             .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-            .header {{ background-color: #059669; color: white; padding: 20px; text-align: center; }}
+            .header {{ background-color: #1a56db; color: white; padding: 20px; text-align: center; }}
             .content {{ padding: 20px; background-color: #f9fafb; }}
             .footer {{ padding: 20px; text-align: center; font-size: 12px; color: #666; }}
-            .round-badge {{ background-color: #dbeafe; color: #1e40af; padding: 5px 10px; border-radius: 4px; display: inline-block; }}
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>Negotiation Update</h1>
-                <span class="round-badge">Round {round_number}</span>
+                <h1>Request for Quotation</h1>
             </div>
             <div class="content">
                 <p>Dear {vendor_name},</p>
@@ -330,7 +332,7 @@ def _build_negotiation_html(vendor_name, negotiation_content, round_number, oppo
                 
                 <div style="white-space: pre-wrap;">{negotiation_content}</div>
                 
-                <p>We appreciate your continued engagement.</p>
+                <p>We look forward to your response.</p>
                 
                 <p>Best regards,<br/>
                 {FROM_NAME}</p>
