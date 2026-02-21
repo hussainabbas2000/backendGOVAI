@@ -5,7 +5,7 @@ Uses SendGrid for sending emails to vendors
 
 import os
 from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition
+from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition, ReplyTo
 from dotenv import load_dotenv
 import base64
 from datetime import datetime
@@ -16,6 +16,7 @@ load_dotenv()
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
 FROM_EMAIL = os.getenv("FROM_EMAIL", "procurement@govcontract.com")
 FROM_NAME = os.getenv("FROM_NAME", "GovContract Procurement Team")
+REPLY_TO_EMAIL = os.getenv("REPLY_TO_EMAIL", FROM_EMAIL)
 
 def get_sendgrid_client():
     """Get SendGrid client instance"""
@@ -67,6 +68,8 @@ def send_rfq_email(
             subject=subject,
             html_content=Content("text/html", html_content)
         )
+        
+        message.reply_to = ReplyTo(REPLY_TO_EMAIL)
         
         # Add plain text version
         plain_content = _build_rfq_plain_text(
@@ -145,6 +148,7 @@ def send_negotiation_email(
             subject=subject,
             html_content=Content("text/html", html_content)
         )
+        message.reply_to = ReplyTo(REPLY_TO_EMAIL)
         
         sg = get_sendgrid_client()
         response = sg.send(message)
@@ -198,6 +202,7 @@ def send_notification_email(
             subject=subject,
             html_content=Content("text/html", html_content)
         )
+        message.reply_to = ReplyTo(REPLY_TO_EMAIL)
         
         sg = get_sendgrid_client()
         response = sg.send(message)

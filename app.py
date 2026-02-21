@@ -15,6 +15,7 @@ from compliance import compliance_bp, init_compliance_db
 from pdf_generator import pdf_bp, init_pdf_db
 from email_webhook import webhook_bp, init_webhook_db
 from background_jobs import init_background_jobs, get_scheduler_status, start_negotiation_for_session
+from suggestions import suggestions_bp
 
 load_dotenv()
 app = Flask(__name__)
@@ -43,6 +44,7 @@ app.register_blueprint(notifications_bp)
 app.register_blueprint(compliance_bp)
 app.register_blueprint(pdf_bp)
 app.register_blueprint(webhook_bp)
+app.register_blueprint(suggestions_bp)
 
 from quote import NegotiationSession, Supplier, Message
 from notifications import Notification
