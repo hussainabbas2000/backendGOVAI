@@ -1,5 +1,6 @@
 import os
 import io
+import time
 import tempfile
 import requests
 from flask import Flask, request, jsonify, Blueprint
@@ -203,6 +204,16 @@ def parse_raw_output(raw_output):
         print("Failed to parse raw_output:", e)
         return None
 
+DIRECT_UPLOAD_SUFFIXES = {
+    "pdf": ".pdf",
+    "docx": ".docx",
+    "txt": ".txt",
+    "md": ".md",
+}
+
+CONVERT_TO_PDF_TYPES = {"xlsx", "xls", "csv", "html"}
+
+
 def _detect_file_type(url, content_type):
     """Detect file type from URL extension and Content-Type header."""
     from urllib.parse import urlparse
@@ -217,6 +228,7 @@ def _detect_file_type(url, content_type):
         '.html': 'html',
         '.htm': 'html',
         '.txt': 'txt',
+        '.md': 'md',
         '.csv': 'csv',
     }
     if ext in type_map:
@@ -225,15 +237,43 @@ def _detect_file_type(url, content_type):
     ct = (content_type or '').lower()
     if 'pdf' in ct:
         return 'pdf'
-    if 'wordprocessingml' in ct or 'msword' in ct:
+    if 'wordprocessingml' in ct:
         return 'docx'
-    if 'spreadsheetml' in ct or 'ms-excel' in ct:
+    if 'msword' in ct:
+        return 'doc'
+    if 'spreadsheetml' in ct:
         return 'xlsx'
+    if 'ms-excel' in ct:
+        return 'xls'
+    if 'text/markdown' in ct:
+        return 'md'
+    if 'text/csv' in ct:
+        return 'csv'
     if 'html' in ct:
         return 'html'
-    if 'text/plain' in ct or 'text/csv' in ct:
+    if 'text/plain' in ct:
         return 'txt'
     
+    return 'unknown'
+
+def _sniff_file_type(file_content):
+    """Best-effort file type sniffing for generic URLs/content-types."""
+    if file_content[:5] == b'%PDF-':
+        return 'pdf'
+
+    # Office Open XML formats are ZIP containers.
+    if file_content[:2] == b'PK':
+        try:
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(file_content)) as zf:
+                names = zf.namelist()
+                if any(name.startswith("word/") for name in names):
+                    return 'docx'
+                if any(name.startswith("xl/") for name in names):
+                    return 'xlsx'
+        except Exception:
+            pass
+
     return 'unknown'
 
 
@@ -313,32 +353,53 @@ def _convert_to_pdf(file_content, file_type):
 
 def download_and_upload_files(urls):
     uploaded_files = []
+    stats = {
+        "requested": len(urls),
+        "uploaded": 0,
+        "skipped": 0,
+        "skipped_details": [],
+    }
     for url in urls:
+        tmp_path = None
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=60)
             response.raise_for_status()
             
             content_type = response.headers.get('Content-Type', '')
             file_type = _detect_file_type(url, content_type)
-            print(f"  File type detected: {file_type} for {url[:80]}...")
+            sniffed_type = _sniff_file_type(response.content)
+            if sniffed_type != 'unknown' and file_type in {'unknown', 'doc', 'xls'}:
+                file_type = sniffed_type
+            print(f"  File type detected: {file_type} for {url[:80]}...", flush=True)
             
-            if file_type == 'pdf':
+            if file_type in DIRECT_UPLOAD_SUFFIXES:
                 file_bytes = response.content
-            elif file_type == 'unknown':
-                # Try treating as PDF first (some servers don't set proper Content-Type)
-                if response.content[:5] == b'%PDF-':
-                    file_bytes = response.content
-                else:
-                    print(f"  Skipping unsupported file type for: {url[:80]}")
-                    continue
-            else:
+                upload_suffix = DIRECT_UPLOAD_SUFFIXES[file_type]
+                print(f"  Uploading original {file_type} file", flush=True)
+            elif file_type == 'doc':
+                reason = "Legacy .doc format (unsupported)"
+                stats["skipped"] += 1
+                stats["skipped_details"].append({"url": url[:100], "reason": reason})
+                print(f"  Skipping: {reason} for {url[:80]}...", flush=True)
+                continue
+            elif file_type in CONVERT_TO_PDF_TYPES:
                 file_bytes = _convert_to_pdf(response.content, file_type)
                 if not file_bytes:
-                    print(f"  Failed to convert {file_type} to PDF for: {url[:80]}")
+                    reason = f"Failed to convert {file_type} to PDF"
+                    stats["skipped"] += 1
+                    stats["skipped_details"].append({"url": url[:100], "reason": reason})
+                    print(f"  Skipping: {reason} for {url[:80]}...", flush=True)
                     continue
-                print(f"  Converted {file_type} to PDF ({len(file_bytes)} bytes)")
+                upload_suffix = ".pdf"
+                print(f"  Converted {file_type} to PDF ({len(file_bytes)} bytes)", flush=True)
+            else:
+                reason = f"Unsupported file type: {file_type}"
+                stats["skipped"] += 1
+                stats["skipped_details"].append({"url": url[:100], "reason": reason})
+                print(f"  Skipping: {reason} for {url[:80]}...", flush=True)
+                continue
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=upload_suffix) as tmp:
                 tmp.write(file_bytes)
                 tmp_path = tmp.name
 
@@ -352,70 +413,242 @@ def download_and_upload_files(urls):
                 "type": "input_file",
                 "file_id": upload.id
             })
-
-            try:
-                os.unlink(tmp_path)
-            except Exception as del_err:
-                print(f"Warning: Could not delete temp file {tmp_path}: {del_err}")
+            stats["uploaded"] += 1
 
         except Exception as e:
-            print(f"Error downloading or uploading file from {url}: {e}")
-    return uploaded_files
+            reason = str(e)
+            stats["skipped"] += 1
+            stats["skipped_details"].append({"url": url[:100], "reason": reason})
+            print(f"Error downloading or uploading file from {url}: {e}", flush=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception as del_err:
+                    print(f"Warning: Could not delete temp file {tmp_path}: {del_err}", flush=True)
+    return uploaded_files, stats
 
 
 # Prompt for extracting key info from a single document
 EXTRACTION_PROMPT = """
-Extract the following key information from this document in JSON format:
-- solicitation_number
-- naics_codes (list)
-- psc_fsc_code
-- set_aside_type
-- contract_type
-- response_deadline
-- submission_method
-- evaluation_criteria
-- product_service_description
-- quantity_units_delivery
-- contracting_officer_contact
-- far_clauses (list)
-- key_requirements (list of strings)
+Extract information from this document and return it ONLY as a valid JSON object with exactly these 9 top-level keys.
+Only extract what is explicitly present in this document. Use null for any field not found. Do not add any fields not listed below.
 
-If any field is not found, use null. Return ONLY valid JSON, no other text.
+{
+  "solicitation_metadata": {
+    "solicitation_number": null,
+    "amendment_numbers": [],
+    "agency_name": null,
+    "contracting_office": null,
+    "naics_code": null,
+    "psc_code": null,
+    "set_aside_type": null,
+    "contract_type": null,
+    "response_deadline_date": null,
+    "response_deadline_time": null,
+    "time_zone": null,
+    "posted_date": null,
+    "period_of_performance": null,
+    "place_of_performance": null,
+    "unique_entity_id_required": null,
+    "sam_registration_required": null
+  },
+  "submission_requirements": {
+    "submission_method": null,
+    "submission_email_address": null,
+    "subject_line_format_requirement": null,
+    "file_naming_requirements": null,
+    "page_limits": null,
+    "font_formatting_requirements": null,
+    "required_attachments_list": [],
+    "required_forms": [],
+    "amendment_acknowledgment_required": null,
+    "deadline_time_zone": null,
+    "late_submission_policy": null,
+    "questions_due_date": null,
+    "questions_submission_method": null
+  },
+  "pricing_clin_information": {
+    "clin_structure": [],
+    "option_years": null,
+    "ceiling_value": null,
+    "funding_type": null,
+    "pricing_spreadsheet_provided": null,
+    "required_price_breakdown_format": null,
+    "fob_terms": null
+  },
+  "technical_requirements": {
+    "scope_of_work_summary": null,
+    "detailed_technical_specifications": [],
+    "brand_name_requirement": null,
+    "brand_name_or_equal": null,
+    "salient_characteristics": [],
+    "installation_required": null,
+    "warranty_requirements": null,
+    "required_certifications": [],
+    "packaging_requirements": null,
+    "delivery_timeline": null,
+    "security_clearance_required": null,
+    "key_personnel_requirement": null,
+    "past_performance_requirement": null,
+    "minimum_years_of_experience": null
+  },
+  "evaluation_criteria": {
+    "evaluation_method": null,
+    "evaluation_factors": [],
+    "price_weight_percent": null,
+    "technical_weight_percent": null,
+    "past_performance_weight_percent": null,
+    "basis_of_award": null,
+    "price_realism_analysis_required": null
+  },
+  "compliance_regulatory": {
+    "far_clauses": [],
+    "dfars_clauses": [],
+    "buy_american_required": null,
+    "trade_agreements_act_required": null,
+    "itar_ear_restrictions": null,
+    "cmmc_nist_cybersecurity_requirements": null,
+    "insurance_requirements": null,
+    "bonding_requirements": null,
+    "wage_determination_included": null
+  },
+  "delivery_information": {
+    "ship_to_address": null,
+    "delivery_days_aro": null,
+    "installation_location": null,
+    "special_handling_requirements": null,
+    "government_furnished_equipment": null
+  },
+  "amendments_attachments": {
+    "number_of_amendments": null,
+    "amendment_summaries": [],
+    "amendment_acknowledgment_required": null,
+    "list_of_attachments": [],
+    "pricing_template_attachment": null,
+    "drawings_technical_files_included": null,
+    "qa_document_included": null
+  },
+  "disqualification_risk_factors": {
+    "mandatory_site_visit": null,
+    "exact_model_required": null,
+    "extremely_short_delivery_window": null,
+    "strict_formatting_requirements": null,
+    "bonding_threshold": null,
+    "insurance_threshold": null,
+    "security_clearance_required": null,
+    "multiple_mandatory_forms": null,
+    "registration_in_additional_systems_required": null
+  }
+}
+
+Return ONLY the filled-in JSON. No explanation, no markdown, no extra text.
 """
 
-# Prompt for combining extracted data into final summary
+# Prompt for combining extracted data into final merged summary
 FINAL_SUMMARY_PROMPT = """
-Based on the following extracted data from multiple solicitation documents, create a comprehensive analysis following this structure:
+You are merging multiple JSON extractions from different solicitation documents into one final JSON.
+All input JSONs share exactly this schema with 9 top-level keys:
+solicitation_metadata, submission_requirements, pricing_clin_information, technical_requirements,
+evaluation_criteria, compliance_regulatory, delivery_information, amendments_attachments, disqualification_risk_factors.
 
-**Extracted Data:**
-{extracted_data}
+Merge rules:
+- For scalar fields (strings, Yes/No, numbers): use the first non-null value found across all documents.
+- For list fields (arrays): combine all values from all documents into one deduplicated list.
+- For narrative/summary fields (scope_of_work_summary, detailed_technical_specifications, etc.): synthesize all non-null values into one clear, comprehensive value.
+- If a field is null in all documents, keep it null.
+- Do NOT add any fields not in the schema. Do NOT remove any fields.
+- Return ONLY valid JSON. No explanation, no markdown, no extra text.
 
-**Original System Instructions:**
-""" + SYSTEM_PROMPT["text"] + """
-
-Combine all the extracted information into a single cohesive summary. Return your response as valid JSON.
+Input data (list of per-document JSONs):
 """
+
+
+def _is_rate_limit_error(e):
+    """Check if exception is a 429 rate limit error — these should be retried"""
+    err_str = str(e).lower()
+    return "429" in str(e) or "rate_limit" in err_str or "rate limit" in err_str
+
+
+def _is_retryable_error(e):
+    """For final summary only: retry on both 429 and 500"""
+    err_str = str(e).lower()
+    return (
+        "429" in str(e) or "rate_limit" in err_str or "rate limit" in err_str
+        or "500" in str(e) or "server_error" in err_str
+    )
 
 
 def analyze_single_document(file_input):
     """Analyze a single document and extract key information"""
-    try:
-        response = openai_client.responses.create(
-            model="gpt-4o-mini",  # Use mini for individual doc extraction (cheaper & faster)
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        file_input,
-                        {"type": "input_text", "text": EXTRACTION_PROMPT}
-                    ]
-                }
-            ]
-        )
-        raw_output = response.output_text
-        # Try to parse JSON
+    max_retries = 4
+    backoff_secs = [2, 5, 10, 20]
+
+    for attempt in range(max_retries):
         try:
-            # Clean up the response - remove markdown code blocks if present
+            response = openai_client.responses.create(
+                model="gpt-4o-mini",  # Use mini for individual doc extraction (cheaper & faster)
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            file_input,
+                            {"type": "input_text", "text": EXTRACTION_PROMPT}
+                        ]
+                    }
+                ]
+            )
+            raw_output = response.output_text
+            # Try to parse JSON
+            try:
+                # Clean up the response - remove markdown code blocks if present
+                cleaned = raw_output.strip()
+                if cleaned.startswith("```json"):
+                    cleaned = cleaned[7:]
+                if cleaned.startswith("```"):
+                    cleaned = cleaned[3:]
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3]
+                return json.loads(cleaned.strip())
+            except Exception:
+                return {"raw_text": raw_output}
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < max_retries - 1:
+                wait = backoff_secs[attempt]
+                print(f"  Rate limit hit, retrying in {wait}s (attempt {attempt + 1}/{max_retries})...", flush=True)
+                time.sleep(wait)
+            else:
+                if not _is_rate_limit_error(e):
+                    print(f"  Server error on document, skipping: {e}", flush=True)
+                else:
+                    print(f"  Rate limit exhausted, skipping document: {e}", flush=True)
+                return {"error": str(e)}
+
+
+def create_final_summary(extracted_data_list):
+    """Combine extracted data from all documents into final summary"""
+    raw_output = None
+    max_retries = 4
+    backoff_secs = [2, 5, 10, 20]
+
+    for attempt in range(max_retries):
+        try:
+            combined_data = json.dumps(extracted_data_list, indent=2)
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4o",  # Use full model for final synthesis
+                messages=[
+                    {
+                        "role": "user",
+                        "content": FINAL_SUMMARY_PROMPT + combined_data
+                    }
+                ],
+                max_tokens=16000,
+                temperature=0.1
+            )
+
+            raw_output = response.choices[0].message.content
+            # Clean and parse
             cleaned = raw_output.strip()
             if cleaned.startswith("```json"):
                 cleaned = cleaned[7:]
@@ -424,49 +657,21 @@ def analyze_single_document(file_input):
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
             return json.loads(cleaned.strip())
-        except:
-            return {"raw_text": raw_output}
-    except Exception as e:
-        print(f"Error analyzing document: {e}")
-        return {"error": str(e)}
-
-
-def create_final_summary(extracted_data_list):
-    """Combine extracted data from all documents into final summary"""
-    try:
-        combined_data = json.dumps(extracted_data_list, indent=2)
-        
-        response = openai_client.chat.completions.create(
-            model="gpt-4o",  # Use full model for final synthesis
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT["text"]
-                },
-                {
-                    "role": "user", 
-                    "content": f"Here is the extracted data from the solicitation documents:\n\n{combined_data}\n\nPlease provide the full analysis as per your instructions. Return valid JSON only."
-                }
-            ],
-            max_tokens=4000,
-            temperature=0.3
-        )
-        
-        raw_output = response.choices[0].message.content
-        # Clean and parse
-        cleaned = raw_output.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        return json.loads(cleaned.strip())
-    except json.JSONDecodeError:
-        return {"raw_output": raw_output}
-    except Exception as e:
-        print(f"Error creating final summary: {e}")
-        return {"error": str(e)}
+        except json.JSONDecodeError as e:
+            preview = (raw_output[:500] + "...") if raw_output and len(raw_output) > 500 else raw_output
+            print(f"[create_final_summary] JSONDecodeError: {e}", flush=True)
+            print(f"[create_final_summary] Raw output preview: {preview}", flush=True)
+            return {"error": f"Invalid JSON from model: {e}", "raw_output_preview": preview}
+        except Exception as e:
+            if _is_retryable_error(e) and attempt < max_retries - 1:
+                wait = backoff_secs[attempt]
+                print(f"[create_final_summary] Retryable error (429/500), retrying in {wait}s (attempt {attempt + 1}/{max_retries})...", flush=True)
+                time.sleep(wait)
+            else:
+                import traceback
+                print(f"[create_final_summary] Exception: {e}", flush=True)
+                print(f"[create_final_summary] Traceback: {traceback.format_exc()}", flush=True)
+                return {"error": str(e)}
 
 
 @app.route("/analyze-solicitations", methods=["POST"])
@@ -477,36 +682,95 @@ def analyze_solicitations():
     if not urls or not isinstance(urls, list):
         return jsonify({"error": "Missing or invalid 'urls' array."}), 400
 
-    print(f"Processing {len(urls)} documents in batches...")
-    
+    print(f"[analyze-solicitations] Documents requested: {len(urls)}", flush=True)
+
     # Upload files to OpenAI
-    file_inputs = download_and_upload_files(urls)
+    file_inputs, upload_stats = download_and_upload_files(urls)
+
+    # Log upload stats
+    print(f"[analyze-solicitations] Upload phase: requested={upload_stats['requested']}, "
+          f"uploaded={upload_stats['uploaded']}, skipped={upload_stats['skipped']}", flush=True)
+    if upload_stats["skipped_details"]:
+        for d in upload_stats["skipped_details"]:
+            print(f"  - Skipped: {d['reason']} | {d['url']}...", flush=True)
+
     if not file_inputs:
-        return jsonify({"error": "Failed to upload any files."}), 500
+        return jsonify({
+            "error": "Failed to upload any files.",
+            "processing_stats": {
+                "documents_requested": upload_stats["requested"],
+                "documents_uploaded": 0,
+                "documents_skipped": upload_stats["skipped"],
+                "documents_analyzed": 0,
+                "documents_in_summary": 0,
+                "skipped_details": upload_stats["skipped_details"],
+            }
+        }), 500
 
     # Step 1: Process each document separately to extract key info
-    print("Step 1: Extracting key information from each document...")
+    print(f"[analyze-solicitations] Step 1: Extracting key information from {len(file_inputs)} document(s)...", flush=True)
     extracted_data = []
     for i, file_input in enumerate(file_inputs):
-        print(f"  Processing document {i+1}/{len(file_inputs)}...")
+        if i > 0:
+            time.sleep(3)  # Delay between documents to avoid rate limits
+        print(f"  Processing document {i+1}/{len(file_inputs)}...", flush=True)
         doc_data = analyze_single_document(file_input)
         doc_data["document_index"] = i + 1
         extracted_data.append(doc_data)
-    
+
     # Filter out documents that failed to analyze
     successful_data = [d for d in extracted_data if "error" not in d]
-    print(f"Extracted data from {len(successful_data)}/{len(extracted_data)} documents (skipped {len(extracted_data) - len(successful_data)} failures)")
-    
+    failed_count = len(extracted_data) - len(successful_data)
+
+    print(f"[analyze-solicitations] Extraction phase: analyzed={len(successful_data)}/{len(file_inputs)}, "
+          f"failed={failed_count}", flush=True)
+    if failed_count > 0:
+        for i, d in enumerate(extracted_data):
+            if "error" in d:
+                print(f"  - Document {i+1} failed: {d.get('error', 'unknown')}", flush=True)
+
     if not successful_data:
-        return jsonify({"error": "All documents failed to analyze."}), 500
-    
+        return jsonify({
+            "error": "All documents failed to analyze.",
+            "processing_stats": {
+                "documents_requested": upload_stats["requested"],
+                "documents_uploaded": upload_stats["uploaded"],
+                "documents_skipped": upload_stats["skipped"],
+                "documents_analyzed": 0,
+                "documents_in_summary": 0,
+                "skipped_details": upload_stats["skipped_details"],
+            }
+        }), 500
+
     # Step 2: Combine all extracted data into final summary
-    print("Step 2: Creating final comprehensive summary...")
+    print(f"[analyze-solicitations] Step 2: Creating final summary from {len(successful_data)} document(s)...", flush=True)
     try:
         final_summary = create_final_summary(successful_data)
+        processing_stats = {
+            "documents_requested": upload_stats["requested"],
+            "documents_uploaded": upload_stats["uploaded"],
+            "documents_skipped": upload_stats["skipped"],
+            "documents_analyzed": len(successful_data),
+            "documents_in_summary": len(successful_data),
+            "skipped_details": upload_stats["skipped_details"],
+        }
+        final_summary["processing_stats"] = processing_stats
+        print(f"[analyze-solicitations] Done. Summary generated from {len(successful_data)}/{upload_stats['requested']} "
+              f"requested documents.", flush=True)
         return jsonify(final_summary)
     except Exception as e:
-        return jsonify({"error": str(e), "extracted_data": extracted_data}), 500
+        return jsonify({
+            "error": str(e),
+            "extracted_data": extracted_data,
+            "processing_stats": {
+                "documents_requested": upload_stats["requested"],
+                "documents_uploaded": upload_stats["uploaded"],
+                "documents_skipped": upload_stats["skipped"],
+                "documents_analyzed": len(successful_data),
+                "documents_in_summary": 0,
+                "skipped_details": upload_stats["skipped_details"],
+            }
+        }), 500
 
 
 @app.route("/message-chat", methods=["POST"])
